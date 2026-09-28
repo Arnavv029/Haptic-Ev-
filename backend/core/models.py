@@ -42,6 +42,7 @@ class CustomUser(AbstractUser):
     ROLE_CHOICES = [
         ('user', 'EV Owner / User'),      # Can book slots
         ('owner', 'Station Owner'),        # Can add stations & verify QR
+        ('mechanic', 'Mechanic'),          # Can add shop and accept SOS bookings
     ]
 
     # This field determines what the person can do in the system
@@ -65,6 +66,10 @@ class CustomUser(AbstractUser):
     def is_ev_user(self):
         """Helper method: returns True if this user is an EV owner"""
         return self.role == 'user'
+
+    def is_mechanic(self):
+        """Helper: returns True if this user is a mechanic"""
+        return self.role == 'mechanic'
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -111,6 +116,10 @@ class Station(models.Model):
 
     # Charging speed info (e.g., "Fast Charger - 50kW")
     charger_type = models.CharField(max_length=100, blank=True, null=True)
+    # Rated output of the charging point. Lets the UI show an honest per-unit
+    # estimate ("₹450/hr ≈ ₹15/kWh at 30 kW") instead of an hourly price alone,
+    # and tells two-wheeler riders whether a point is overkill for them.
+    power_kw     = models.PositiveSmallIntegerField(null=True, blank=True)
 
     # Price charged per hour of charging (e.g., ₹80.00 per hour)
     price_per_hour = models.DecimalField(
@@ -359,6 +368,51 @@ class Review(models.Model):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# EMERGENCY REQUEST (SOS) — User requests mechanic help
+# ══════════════════════════════════════════════════════════════════════════════
+class EmergencyRequest(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('accepted', 'Accepted'),
+        ('rejected', 'Rejected'),
+        ('completed', 'Completed'),
+    ]
+
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name='emergency_requests')
+    mechanic = models.ForeignKey('Mechanic', on_delete=models.SET_NULL, related_name='requests', null=True, blank=True)
+    phone = models.CharField(max_length=15)
+    vehicle_number = models.CharField(max_length=30, blank=True, null=True)
+    message = models.TextField(blank=True, null=True)
+    latitude = models.FloatField(null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"SOS #{self.id} by {self.user.username} — {self.status}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MECHANIC REVIEW — Reviews for mechanics (separate from station reviews)
+# ══════════════════════════════════════════════════════════════════════════════
+class MechanicReview(models.Model):
+    user = models.ForeignKey(CustomUser, on_delete=models.CASCADE, related_name='mechanic_reviews')
+    mechanic = models.ForeignKey('Mechanic', on_delete=models.CASCADE, related_name='reviews')
+    rating = models.PositiveSmallIntegerField()
+    comment = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"{self.rating}★ for {self.mechanic.name} by {self.user.username}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 6. MECHANIC MODEL  (Emergency Section)
 # ══════════════════════════════════════════════════════════════════════════════
 class Mechanic(models.Model):
@@ -386,17 +440,33 @@ class Mechanic(models.Model):
     ]
 
     name             = models.CharField(max_length=200)
+    # Link to auth user so mechanics can log in with same account
+    user             = models.OneToOneField(
+        CustomUser,
+        on_delete=models.CASCADE,
+        related_name='mechanic_profile',
+        null=True,
+        blank=True,
+        limit_choices_to={'role': 'mechanic'}
+    )
     phone            = models.CharField(max_length=15)
     specialization   = models.CharField(max_length=30, choices=SPECIALIZATION_CHOICES, default='general')
     location_text    = models.CharField(max_length=500)
     latitude         = models.FloatField(null=True, blank=True)
     longitude        = models.FloatField(null=True, blank=True)
     experience_years = models.PositiveIntegerField(default=1)
+    service_cost     = models.PositiveIntegerField(
+        default=500,
+        help_text='Estimated service charge in INR'
+    )
     is_available     = models.BooleanField(default=True)
     rating           = models.DecimalField(max_digits=3, decimal_places=1, default=4.0)
     review_count     = models.PositiveIntegerField(default=0)
     photo            = models.ImageField(upload_to='mechanics/', blank=True, null=True)
     created_at       = models.DateTimeField(auto_now_add=True)
+
+    # Optional link to the website user account (mechanic role)
+    # (added earlier via migration) — keep for reference
 
     class Meta:
         ordering = ['-is_available', '-rating']
@@ -453,3 +523,52 @@ class PaymentAttempt(models.Model):
     def __str__(self):
         return f"Attempt {self.razorpay_order_id} | {self.user.username} | {self.status}"
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EMAIL VERIFICATION  (sign-up OTP)
+# ══════════════════════════════════════════════════════════════════════════════
+class EmailVerification(models.Model):
+    """
+    One-time code proving somebody owns the email they're signing up with.
+
+    Security notes:
+      • The code is stored as a SHA-256 hash, never in plain text — a database
+        leak must not hand out working codes.
+      • Codes expire (OTP_TTL_MINUTES) and allow a limited number of guesses.
+      • On success we issue a short-lived `token`; registration accepts that
+        token instead of the code, so the code is used exactly once.
+    """
+
+    OTP_TTL_MINUTES = 10        # how long a code stays valid
+    TOKEN_TTL_MINUTES = 30      # how long "this email is verified" lasts
+    MAX_ATTEMPTS = 5            # wrong guesses before the code is burned
+    RESEND_COOLDOWN_SECONDS = 60
+    MAX_SENDS_PER_HOUR = 5
+
+    email        = models.EmailField(db_index=True)
+    code_hash    = models.CharField(max_length=64)
+    token        = models.CharField(max_length=64, blank=True, db_index=True)
+
+    attempts     = models.PositiveSmallIntegerField(default=0)
+    sends        = models.PositiveSmallIntegerField(default=1)
+    is_verified  = models.BooleanField(default=False)
+    is_consumed  = models.BooleanField(default=False)   # True once an account is created
+
+    expires_at   = models.DateTimeField()
+    verified_at  = models.DateTimeField(null=True, blank=True)
+    last_sent_at = models.DateTimeField(auto_now_add=True)
+    created_at   = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name = 'Email verification'
+
+    def __str__(self):
+        state = 'verified' if self.is_verified else 'pending'
+        return f'{self.email} ({state})'
+
+    @property
+    def is_expired(self):
+        from django.utils import timezone
+        return timezone.now() > self.expires_at

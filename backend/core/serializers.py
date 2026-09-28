@@ -126,7 +126,7 @@ class StationSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'description', 'location_text',
             'latitude', 'longitude', 'phone',
-            'total_slots', 'available_slots', 'charger_type', 'price_per_hour', 'is_active',
+            'total_slots', 'available_slots', 'charger_type', 'power_kw', 'price_per_hour', 'is_active',
             'owner', 'owner_name', 'distance', 'image', 'image_url',
             'avg_rating', 'review_count',
             'created_at'
@@ -200,17 +200,53 @@ class TimeSlotSerializer(serializers.ModelSerializer):
     # These call the @property methods defined in the TimeSlot model
     is_full = serializers.BooleanField(read_only=True)
     available_spots = serializers.IntegerField(read_only=True)
+    dynamic_price = serializers.SerializerMethodField()
 
     class Meta:
         model = TimeSlot
         fields = [
             'id', 'station', 'date', 'start_time', 'end_time',
             'capacity', 'booked_count', 'is_available',
-            'is_full', 'available_spots'
+            'is_full', 'available_spots', 'dynamic_price'
         ]
         extra_kwargs = {
             'booked_count': {'read_only': True},  # Backend manages this, not user input
         }
+
+    def validate_capacity(self, value):
+        if value < 1:
+            raise serializers.ValidationError('Capacity must be at least 1.')
+        return value
+
+    def validate(self, attrs):
+        from django.utils import timezone
+        start = attrs.get('start_time', getattr(self.instance, 'start_time', None))
+        end = attrs.get('end_time', getattr(self.instance, 'end_time', None))
+        slot_date = attrs.get('date', getattr(self.instance, 'date', None))
+        if start and end and end <= start:
+            raise serializers.ValidationError({'end_time': 'End time must be after start time.'})
+        if self.instance is None and slot_date:
+            now = timezone.localtime()
+            if slot_date < now.date():
+                raise serializers.ValidationError({'date': 'Cannot create slots for a past date.'})
+            if slot_date == now.date() and start and start <= now.time():
+                raise serializers.ValidationError({'start_time': f'{start.strftime("%H:%M")} has already passed today.'})
+        if self.instance is not None and 'capacity' in attrs and attrs['capacity'] < self.instance.booked_count:
+            raise serializers.ValidationError(
+                {'capacity': f'{self.instance.booked_count} car(s) already booked; capacity cannot be lower.'}
+            )
+        return attrs
+
+    def get_dynamic_price(self, obj):
+        from utils.llm_enhanced_pricing import get_slot_dynamic_price
+        pricing_info = get_slot_dynamic_price(obj)
+        return {
+            'hourly_rate': pricing_info['price'],
+            'base_rate': pricing_info['base_price'],
+            'currency': pricing_info['currency'],
+            'explanation': pricing_info['explanation'],
+        }
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -416,18 +452,26 @@ class MechanicSerializer(serializers.ModelSerializer):
     )
     distance = serializers.SerializerMethodField()
     photo_url = serializers.SerializerMethodField()
+    topsis_score = serializers.SerializerMethodField()
+    recommendation_reason = serializers.SerializerMethodField()
 
     class Meta:
         model = Mechanic
         fields = [
             'id', 'name', 'phone', 'specialization', 'specialization_display',
             'location_text', 'latitude', 'longitude',
-            'experience_years', 'is_available', 'rating', 'review_count',
-            'distance', 'photo_url',
+            'experience_years', 'service_cost', 'is_available', 'rating', 'review_count',
+            'distance', 'photo_url', 'topsis_score', 'recommendation_reason',
         ]
 
     def get_distance(self, obj):
         return getattr(obj, 'distance', None)
+
+    def get_topsis_score(self, obj):
+        return getattr(obj, 'topsis_score', None)
+
+    def get_recommendation_reason(self, obj):
+        return getattr(obj, 'recommendation_reason', None)
 
     def get_photo_url(self, obj):
         if obj.photo:
@@ -435,3 +479,30 @@ class MechanicSerializer(serializers.ModelSerializer):
             if request:
                 return request.build_absolute_uri(obj.photo.url)
         return None
+
+
+class MechanicProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Mechanic
+        fields = [
+            'id', 'name', 'phone', 'specialization', 'location_text',
+            'latitude', 'longitude', 'experience_years', 'service_cost', 'is_available', 'photo'
+        ]
+
+
+class EmergencyRequestSerializer(serializers.ModelSerializer):
+    user_name = serializers.CharField(source='user.username', read_only=True)
+    mechanic_name = serializers.CharField(source='mechanic.name', read_only=True)
+
+    class Meta:
+        model = None
+        # set dynamically to avoid circular import; set in __init__ below
+
+    def __init__(self, *args, **kwargs):
+        from core.models import EmergencyRequest
+        self.Meta.model = EmergencyRequest
+        self.Meta.fields = [
+            'id', 'user', 'user_name', 'mechanic', 'mechanic_name', 'phone', 'vehicle_number',
+            'message', 'latitude', 'longitude', 'status', 'created_at'
+        ]
+        super().__init__(*args, **kwargs)

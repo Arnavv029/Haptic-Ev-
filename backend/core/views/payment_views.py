@@ -64,13 +64,22 @@ def razorpay_create_order_view(request):
     if slot.booked_count >= slot.capacity:
         return Response({'error': 'Slot is fully booked.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    # 2. Calculate amount
-    try:
-        amount_rupees = float(data.get('amount_paid') or 0)
-    except (TypeError, ValueError):
-        amount_rupees = 0.0
+    # 2. Calculate amount dynamically using LLM-enhanced pricing
+    from utils.llm_enhanced_pricing import get_slot_dynamic_price
+    pricing_info = get_slot_dynamic_price(slot)
+    dynamic_price = pricing_info['price']
 
+    # Calculate slot duration in hours
+    start_mins = slot.start_time.hour * 60 + slot.start_time.minute
+    end_mins = slot.end_time.hour * 60 + slot.end_time.minute
+    duration_mins = end_mins - start_mins
+    if duration_mins <= 0:
+        duration_mins = 60  # Default to 1 hour fallback
+    
+    hrs = max(1.0, round(duration_mins / 60.0, 2))
+    amount_rupees = round(dynamic_price * hrs, 2)
     amount_paise = max(int(amount_rupees * 100), MINIMUM_AMOUNT_PAISE)
+
 
     # 3. Create Razorpay order
     receipt = f"hev-{request.user.id}-{int(time.time())}"
@@ -101,6 +110,7 @@ def razorpay_create_order_view(request):
             'vehicle_number': data.get('vehicle_number', ''),
             'vehicle_type':   data.get('vehicle_type', ''),
             'amount_paid':    amount_rupees,
+            'dynamic_price_explanation': pricing_info.get('explanation', ''),
         },
     )
 
@@ -110,6 +120,12 @@ def razorpay_create_order_view(request):
         'amount':     amount_paise,
         'currency':   'INR',
         'attempt_id': attempt.id,
+        'dynamic_pricing': {
+            'hourly_rate': dynamic_price,
+            'duration_hours': hrs,
+            'total_amount': amount_rupees,
+            'explanation': pricing_info.get('explanation', ''),
+        },
         'prefill': {
             'name':    data.get('full_name', ''),
             'email':   data.get('email', ''),

@@ -161,3 +161,28 @@ RAZORPAY_KEY_ID      = os.environ.get('RAZORPAY_KEY_ID', '')
 RAZORPAY_KEY_SECRET  = os.environ.get('RAZORPAY_KEY_SECRET', '')
 RAZORPAY_WEBHOOK_SECRET = os.environ.get('RAZORPAY_WEBHOOK_SECRET', '')
 
+# ─── LLM API Configuration ────────────────────────────────────────────────────
+# Deepseek LLM local endpoint configuration
+LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'http://localhost:1234')
+LLM_ENABLED = os.environ.get('LLM_ENABLED', 'False').lower() == 'true'
+
+
+
+
+# ─── EMAIL (sign-up verification codes) ───────────────────────────────────────
+# In development, leave EMAIL_HOST unset: Django prints the message — including
+# the OTP — straight to the runserver console, so you can test without SMTP.
+# In production set EMAIL_HOST / EMAIL_HOST_USER / EMAIL_HOST_PASSWORD (an app
+# password, never your real one) and the SMTP backend switches on automatically.
+EMAIL_HOST          = os.environ.get('EMAIL_HOST', '')
+EMAIL_PORT          = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_HOST_USER     = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+EMAIL_USE_TLS       = os.environ.get('EMAIL_USE_TLS', 'True').lower() == 'true'
+DEFAULT_FROM_EMAIL  = os.environ.get('DEFAULT_FROM_EMAIL', 'HapticEV <no-reply@hapticev.in>')
+
+EMAIL_BACKEND = (
+    'django.core.mail.backends.smtp.EmailBackend'
+    if EMAIL_HOST
+    else 'django.core.mail.backends.console.EmailBackend'
+)

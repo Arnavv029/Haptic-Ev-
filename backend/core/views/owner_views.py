@@ -20,7 +20,10 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from django.db.models import Exists, OuterRef
+from datetime import datetime
+
+from django.db.models import Exists, F, OuterRef
+from django.utils import timezone
 
 from core.models import Station, TimeSlot, Booking, Review
 from core.serializers import (
@@ -139,11 +142,14 @@ def owner_station_detail_view(request, pk):
 # ─────────────────────────────────────────────────────────────────────────────
 # CREATE TIME SLOTS
 # ─────────────────────────────────────────────────────────────────────────────
-@api_view(['POST'])
+@api_view(['GET', 'POST'])
 @permission_classes([IsAuthenticated])
 def owner_create_slots_view(request):
     """
-    Owner defines time slots for their station.
+    GET  /api/owner/slots/?station=1&date=2026-05-06
+         → All slots (open AND closed) for one of the owner's stations on a date.
+
+    POST → Owner defines time slots for their station.
 
     The owner can create multiple slots at once using 'bulk' mode,
     or create one slot at a time.
@@ -175,6 +181,28 @@ def owner_create_slots_view(request):
     error = is_owner_or_403(request)
     if error:
         return error
+
+    if request.method == 'GET':
+        try:
+            station = Station.objects.get(pk=request.query_params.get('station'), owner=request.user)
+        except (Station.DoesNotExist, ValueError, TypeError):
+            return Response(
+                {'error': 'Station not found or you do not own this station.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        slot_date = request.query_params.get('date') or str(timezone.localdate())
+        try:
+            datetime.strptime(slot_date, '%Y-%m-%d')
+        except ValueError:
+            return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+        slots = list(TimeSlot.objects.filter(station=station, date=slot_date).order_by('start_time'))
+        for s in slots:
+            s.station = station
+        return Response({
+            'station': station.name,
+            'date': slot_date,
+            'slots': TimeSlotSerializer(slots, many=True).data,
+        }, status=status.HTTP_200_OK)
 
     station_id = request.data.get('station')
     date = request.data.get('date')
@@ -233,6 +261,48 @@ def owner_create_slots_view(request):
                 'slot': serializer.data
             }, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UPDATE / DELETE A SINGLE SLOT
+# ─────────────────────────────────────────────────────────────────────────────
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def owner_slot_detail_view(request, pk):
+    """
+    PATCH  /api/owner/slots/{id}/  Body: { "is_available": false } or { "capacity": 4 }
+           → Close/reopen a slot or change how many cars it takes.
+    DELETE /api/owner/slots/{id}/
+           → Remove a slot. Refused if anyone has ever booked it (bookings would
+             be deleted with it) — close it instead.
+    """
+    error = is_owner_or_403(request)
+    if error:
+        return error
+
+    try:
+        slot = TimeSlot.objects.select_related('station').get(pk=pk, station__owner=request.user)
+    except TimeSlot.DoesNotExist:
+        return Response({'error': 'Slot not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'DELETE':
+        if slot.bookings.exists():
+            return Response(
+                {'error': 'This slot has bookings, so it cannot be deleted. Close it instead to stop new bookings.'},
+                status=status.HTTP_409_CONFLICT
+            )
+        slot.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    allowed = {k: request.data[k] for k in ('is_available', 'capacity') if k in request.data}
+    if not allowed:
+        return Response({'error': 'Send is_available and/or capacity.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    serializer = TimeSlotSerializer(slot, data=allowed, partial=True)
+    if serializer.is_valid():
+        serializer.save()
+        return Response({'message': 'Slot updated.', 'slot': serializer.data}, status=status.HTTP_200_OK)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,9 +417,10 @@ def owner_update_booking_status_view(request, pk):
         new_status = serializer.validated_data['status']
 
         # If owner REJECTS, free up the slot again
-        if new_status == 'rejected' and booking.slot.booked_count > 0:
-            booking.slot.booked_count -= 1
-            booking.slot.save()
+        if new_status == 'rejected':
+            TimeSlot.objects.filter(pk=booking.slot_id, booked_count__gt=0).update(
+                booked_count=F('booked_count') - 1
+            )
 
         return Response({
             'message': f'Booking {new_status} successfully!',

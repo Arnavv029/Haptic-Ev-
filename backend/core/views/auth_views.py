@@ -19,6 +19,8 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate, get_user_model
 
 from core.serializers import UserProfileSerializer
+from core.models import EmailVerification
+from core.utils.email_otp import consume_token, issue_code, normalize_email, verify_code
 
 User = get_user_model()
 
@@ -67,7 +69,7 @@ def register_view(request):
     """
 
     data = request.data
-    email = data.get('email', '').strip()
+    email = normalize_email(data.get('email', ''))
     password = data.get('password', '')
     role = data.get('role', 'user')
     full_name = data.get('full_name', '').strip()
@@ -88,6 +90,15 @@ def register_view(request):
     if User.objects.filter(email=email).exists():
         return Response(
             {'error': 'An account with this email already exists.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    # The address must have been proved via the OTP flow (see otp_request_view /
+    # otp_verify_view). The token is single-use and short-lived.
+    if not consume_token(email, data.get('verification_token', '')):
+        return Response(
+            {'error': 'Please verify your email address before creating an account.',
+             'code': 'email_not_verified'},
             status=status.HTTP_400_BAD_REQUEST
         )
     if User.objects.filter(username=username).exists():
@@ -190,3 +201,62 @@ def login_view(request):
 def me_view(request):
     """Returns the currently logged-in user's profile."""
     return Response(UserProfileSerializer(request.user).data, status=status.HTTP_200_OK)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EMAIL VERIFICATION  (sign-up OTP)
+# ─────────────────────────────────────────────────────────────────────────────
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def otp_request_view(request):
+    """
+    POST /api/auth/otp/request/   { "email": "you@example.com" }
+
+    Emails a 6-digit code. Rate limited per address. Responds 200 even when the
+    address already has an account only after saying so explicitly — signup is
+    a public flow, so a clear message beats silent failure here.
+    """
+    email = normalize_email(request.data.get('email', ''))
+    if not email or '@' not in email:
+        return Response({'error': 'Enter a valid email address.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if User.objects.filter(email=email).exists():
+        return Response(
+            {'error': 'An account with this email already exists. Try logging in instead.'},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+    verification, error = issue_code(email)
+    if error:
+        return Response({'error': error}, status=status.HTTP_429_TOO_MANY_REQUESTS)
+
+    return Response({
+        'message': f'We sent a 6-digit code to {email}.',
+        'expires_in_minutes': EmailVerification.OTP_TTL_MINUTES,
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def otp_verify_view(request):
+    """
+    POST /api/auth/otp/verify/   { "email": "...", "code": "123456" }
+
+    On success returns a short-lived `verification_token`, which the register
+    call must include.
+    """
+    email = normalize_email(request.data.get('email', ''))
+    code = str(request.data.get('code', '')).strip()
+
+    if not email or not code:
+        return Response({'error': 'Email and code are both required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    token, error = verify_code(email, code)
+    if error:
+        return Response({'error': error}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({
+        'message': 'Email verified.',
+        'verification_token': token,
+        'valid_for_minutes': EmailVerification.TOKEN_TTL_MINUTES,
+    }, status=status.HTTP_200_OK)

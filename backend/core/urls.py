@@ -31,6 +31,7 @@ POST    /api/owner/verify-qr/              Owners
 
 from django.urls import path
 from core.views import auth_views, station_views, booking_views, owner_views, review_views, emergency_views, payment_views
+from core.views import mechanic_views
 
 urlpatterns = [
 
@@ -38,6 +39,8 @@ urlpatterns = [
     path('auth/register/', auth_views.register_view,    name='register'),
     path('auth/login/',    auth_views.login_view,       name='login'),
     path('auth/me/',       auth_views.me_view,          name='me'),
+    path('auth/otp/request/', auth_views.otp_request_view, name='otp-request'),
+    path('auth/otp/verify/',  auth_views.otp_verify_view,  name='otp-verify'),
 
     # ── STATIONS (User side — read only) ──────────────────────────────────────
     path('stations/',              station_views.station_list_view,    name='station-list'),
@@ -57,6 +60,7 @@ urlpatterns = [
     path('owner/stations/',                         owner_views.owner_station_view,               name='owner-stations'),
     path('owner/stations/<int:pk>/',                owner_views.owner_station_detail_view,        name='owner-station-detail'),
     path('owner/slots/',                            owner_views.owner_create_slots_view,          name='owner-create-slots'),
+    path('owner/slots/<int:pk>/',                   owner_views.owner_slot_detail_view,           name='owner-slot-detail'),
     path('owner/bookings/',                         owner_views.owner_bookings_view,              name='owner-bookings'),
     path('owner/bookings/<int:pk>/',                owner_views.owner_booking_detail_view,        name='owner-booking-detail'),
     path('owner/bookings/<int:pk>/status/',         owner_views.owner_update_booking_status_view, name='owner-booking-status'),
@@ -65,6 +69,10 @@ urlpatterns = [
     # ── EMERGENCY ENDPOINTS ───────────────────────────────────────────────────
     path('emergency/mechanics/',  emergency_views.emergency_mechanics_view,  name='emergency-mechanics'),
     path('emergency/stations/',   emergency_views.emergency_stations_view,   name='emergency-stations'),
+    # Mechanic APIs (profile + requests)
+    path('mechanic/profile/',     mechanic_views.mechanic_profile_view,     name='mechanic-profile'),
+    path('mechanic/requests/',    mechanic_views.mechanic_requests_view,    name='mechanic-requests'),
+    path('mechanic/requests/<int:pk>/', mechanic_views.mechanic_request_action_view, name='mechanic-request-action'),
 
     # ── RAZORPAY PAYMENT ──────────────────────────────────────────────────────
     path('payments/razorpay/create-order/', payment_views.razorpay_create_order_view, name='razorpay-create-order'),

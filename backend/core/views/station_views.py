@@ -196,26 +196,35 @@ def station_slots_view(request, pk):
             status=status.HTTP_404_NOT_FOUND
         )
 
-    # Get the date from query param, default to today
-    from datetime import date
-    slot_date = request.query_params.get('date', str(date.today()))
+    from datetime import datetime
+    from django.utils import timezone
 
-    # Validate date format
+    now = timezone.localtime()
+    slot_date = request.query_params.get('date', str(now.date()))
+
     try:
-        from datetime import datetime
-        datetime.strptime(slot_date, '%Y-%m-%d')
+        parsed_date = datetime.strptime(slot_date, '%Y-%m-%d').date()
     except ValueError:
         return Response(
             {'error': 'Invalid date format. Use YYYY-MM-DD (e.g., 2026-05-06).'},
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    # Fetch all slots for this station on this date
     slots = TimeSlot.objects.filter(
         station=station,
-        date=slot_date,
+        date=parsed_date,
         is_available=True
     ).order_by('start_time')
+
+    if parsed_date < now.date():
+        slots = slots.none()
+    elif parsed_date == now.date():
+        slots = slots.filter(start_time__gt=now.time())
+
+    # Share one station instance so pricing looks up its rating only once
+    slots = list(slots)
+    for s in slots:
+        s.station = station
 
     serializer = TimeSlotSerializer(slots, many=True)
     return Response({
